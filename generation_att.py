@@ -120,3 +120,110 @@ class DecoderWithAttention(nn.Module):
             alphas[:batch_size_t, t, :] = alpha
 
         return predictions, encoded_captions, decode_lens, alphas
+
+def predict_att(img):
+    # Проверка наличия в папке models модели attention:
+    if not os.path.exists('models/model_attention.pt'):
+        import gdown
+        print('Загрузка модели с гугл диска:')
+        # https://drive.google.com/file/d/1gGo-JGPg0umUHceySjM6oWiLKZJ7wJik/view?usp=share_link
+        url = "https://drive.google.com/uc?id=1gGo-JGPg0umUHceySjM6oWiLKZJ7wJik"
+        output = 'models/model_attention.pt'
+        gdown.download(url, output, quiet=False)
+
+    # Трансформация изображений:
+    transform = T.Compose([T.Resize(256),
+                           T.CenterCrop(224),
+                           T.ToTensor(),
+                           T.Normalize(mean=[0.485, 0.456, 0.406],
+                                       std=[0.229, 0.224, 0.225])])
+
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    llm_model = torch.load('models/model_attention.pt', map_location=torch.device(device))
+    model = tv.models.mobilenet_v3_small(pretrained=True)
+
+    word_to_id = {word: id for id, word in enumerate(words)}
+    llm_model.to(device)
+    model.to(device)
+    llm_model.eval()
+    model.eval()
+
+    vocab_size = len(words)
+    downscale_model_factor = 2 ** 5  # stride 2 is happened 5 times
+    # id to word mapping
+    rev_word_map = {id: word for id, word in enumerate(words)}
+
+    # read and pre-process image
+    img = img.convert('RGB')
+    img = transform(img)  # (3, 256, 256)
+
+    # ==========================================
+    # Feature extraction. encode the image
+    encoder_out = model.features(img.unsqueeze(0).to(device))
+    encoder_out = encoder_out.permute(0, 2, 3, 1)  # (1, enc_image_size, enc_image_size, feature_dim)
+
+    enc_image_size = encoder_out.size(1)
+    encoder_dim = encoder_out.size(3)
+
+    # flatten encoded image representation
+    encoder_out = encoder_out.view(1, -1, encoder_dim)  # (1, num_pixels, encoder_dim)
+    num_pixels = encoder_out.size(1)
+    # ==========================================
+
+    # ==========================================
+    # LLM init
+    prev_words = torch.tensor([[word_to_id['BOS']]], dtype=torch.long).to(device)  # (1, 1)
+    seqs = prev_words  # (1, 1)
+    scores = torch.zeros(1, 1).to(device)  # (1, 1)
+    seqs_alpha = torch.ones(1, 1, enc_image_size, enc_image_size).to(device)  # (1, 1, enc_image_size, enc_image_size)
+
+    # start decoding
+    step = 1
+    h, c = llm_model.init_hidden_state(encoder_out)
+    # ==========================================
+
+    max_steps = 30
+    while True:
+        # ==========================================
+        # Повторяем весь код инференса из llm модели (forward)
+        #
+        embeddings = llm_model.embed(prev_words).squeeze(1)  # (1, embed_dim)
+        attention_weighted_encoding, alpha = llm_model.attention(encoder_out, h)  # (1, encoder_dim), (1, num_pixels, 1)
+        alpha = alpha.view(-1, enc_image_size, enc_image_size)  # (1, enc_image_size, enc_image_size)
+        gate = F.sigmoid(llm_model.f_beta(h))  # gating scalar, (1, encoder_dim)
+        attention_weighted_encoding = gate * attention_weighted_encoding
+        h, c = llm_model.lstm_cell(
+            torch.cat([embeddings, attention_weighted_encoding], dim=1), (h, c)
+        )  # (s, decoder_dim)
+        scores = llm_model.fc(h)  # (s, vocab_size)
+        #
+        # ==========================================
+        scores = F.log_softmax(scores, dim=1)
+        scores = scores.expand_as(scores) + scores  # (1, vocab_size)
+        top_score, top_word = scores.max(dim=1)  # (1)
+        next_word_inds = top_word
+
+        # add new words to sequences, alphas
+        seqs = torch.cat([seqs, next_word_inds.unsqueeze(0)], dim=1)  # (1, step + 1)
+        seqs_alpha = torch.cat(
+            [seqs_alpha, alpha.unsqueeze(1)], dim=1
+        )  # (1W, step + 1, enc_image_size, enc_image_size)
+        if next_word_inds[0] == word_to_id['EOS']:
+            break
+        # break if things have been going on too long
+        if step > max_steps:
+            break
+        prev_words = next_word_inds
+        step += 1
+
+    i = 0
+    seq = seqs[i].tolist()
+
+    caption = [rev_word_map[ind] for ind in seq]
+
+    # Сделаем первую букву заглавной
+    caption[1] = caption[1].title()
+    if caption[-1] == 'EOS':
+        caption = caption[:-1]
+
+    return " ".join(caption[1:])
